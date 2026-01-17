@@ -203,3 +203,40 @@ class Server(Device):
       for name in self.parameter_dict[model_name]:
         self.parameter_dict[model_name][name].data = self.parameter_dict[model_name][name].data + clipped_models[idx:(idx+self.parameter_dict[model_name][name].data.numel())].reshape(self.parameter_dict[model_name][name].data.shape)
         idx += self.parameter_dict[model_name][name].data.numel()
+
+  def flame(self, clients):
+    unique_client_model_names = np.unique([client.model_name for client in clients])
+    for model_name in unique_client_model_names:
+      model_clients = [client for client in clients if client.model_name == model_name]
+      if not model_clients:
+        continue
+      base_weights = self.parameter_dict[model_name]
+      last_name = next(reversed(base_weights))
+      updates = []
+      for client in model_clients:
+        updates.append(torch.flatten(client.W[last_name].detach() - base_weights[last_name].detach()))
+
+      update_stack = torch.stack(updates)
+      norms = torch.norm(update_stack, dim=1, keepdim=True)
+      normalized = update_stack / torch.clamp(norms, min=1e-12)
+      cosine_sim = normalized @ normalized.T
+      cosine_dist = (1.0 - cosine_sim).cpu().numpy()
+
+      min_cluster_size = len(model_clients) // 3 + 1
+      clusterer = hdbscan.HDBSCAN(
+          metric="precomputed",
+          min_cluster_size=min_cluster_size,
+          min_samples=2,
+          allow_single_cluster=False,
+      )
+      labels = clusterer.fit_predict(cosine_dist)
+
+      valid_labels = labels[labels >= 0]
+      if valid_labels.size == 0:
+        admitted = model_clients
+      else:
+        unique_labels, counts = np.unique(valid_labels, return_counts=True)
+        largest_label = unique_labels[np.argmax(counts)]
+        admitted = [client for client, label in zip(model_clients, labels) if label == largest_label]
+
+      reduce_average(target=self.parameter_dict[model_name], sources=[client.W for client in admitted])

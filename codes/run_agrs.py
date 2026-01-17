@@ -98,32 +98,59 @@ def run_experiment(xp, xp_count, n_experiments):
   server = Server(np.unique(model_names), test_loader, num_classes=num_classes, dataset = hp['dataset'])
   
   initial_model_state = server.models[0].state_dict().copy()
-  if hp["attack_rate"] == 0:
+  attack_methods = hp.get("attack_methods")
+  if attack_methods:
+    attacker_plan = []
+    for method_name, count in attack_methods.items():
+      attacker_plan.extend([method_name] * int(count))
+    benign_count = len(client_loaders) - len(attacker_plan)
+    if benign_count < 0:
+      raise ValueError("attack_methods exceed number of clients")
+    attack_rate = len(attacker_plan) / len(client_loaders)
+  else:
+    attack_rate = hp["attack_rate"]
+    benign_count = int((1 - attack_rate) * len(client_loaders))
+    attacker_plan = [hp["attack_method"]] * (len(client_loaders) - benign_count)
+  attack_method_set = set(attacker_plan)
+
+  if attack_rate == 0:
         clients = [Client(model_name, optimizer_fn, loader, idnum=i, num_classes=num_classes, dataset = hp['dataset']) for i, (loader, model_name) in enumerate(zip(client_loaders, model_names))]
+        for client in clients:
+          client.attack_method = "benign"
   else:
     clients = []
     for i, (loader, model_name) in enumerate(zip(client_loaders, model_names)):
-        if i < (1 - hp["attack_rate"])* len(client_loaders):
+        if i < benign_count:
           clients.append(Client(model_name, optimizer_fn, loader, idnum=i, num_classes=num_classes, dataset = hp['dataset']) )
+          clients[-1].attack_method = "benign"
         else:
           print(i)
-          if hp["attack_method"] == "label_flip":
+          attack_method = attacker_plan[i - benign_count]
+          if attack_method == "label_flip":
             clients.append(Client_flip(model_name, optimizer_fn, loader, idnum=i, num_classes=num_classes, dataset = hp['dataset']))
-          elif hp["attack_method"] == "targeted_label_flip":
+            clients[-1].attack_method = attack_method
+          elif attack_method == "targeted_label_flip":
             clients.append(Client_tr_flip(model_name, optimizer_fn, loader, idnum=i, num_classes=num_classes, dataset = hp['dataset']))
-          elif hp["attack_method"] == "Fang":
+            clients[-1].attack_method = attack_method
+          elif attack_method == "Fang":
             clients.append(Client_Fang(model_name, optimizer_fn, loader, idnum=i, num_classes=num_classes, dataset = hp['dataset']) )
-          elif hp["attack_method"] == "MPAF":
+            clients[-1].attack_method = attack_method
+          elif attack_method == "MPAF":
             clients.append(Client_MPAF(model_name, optimizer_fn, loader, idnum=i, num_classes=num_classes, dataset = hp['dataset']) )
+            clients[-1].attack_method = attack_method
             clients[-1].init_model = initial_model_state
-          elif hp["attack_method"] == "Min-Max":
+          elif attack_method == "Min-Max":
             clients.append(Client_MinMax(model_name, optimizer_fn, loader, idnum=i, num_classes=num_classes, dataset = hp['dataset']) )
-          elif hp["attack_method"] == "Min-Sum":
+            clients[-1].attack_method = attack_method
+          elif attack_method == "Min-Sum":
             clients.append(Client_MinSum(model_name, optimizer_fn, loader, idnum=i, num_classes=num_classes, dataset = hp['dataset']) )
-          elif hp["attack_method"] == "Scaling":
+            clients[-1].attack_method = attack_method
+          elif attack_method == "Scaling":
             clients.append(Client_Scaling(model_name, optimizer_fn, loader, idnum=i, num_classes=num_classes, dataset = hp['dataset']) )
-          elif hp["attack_method"] == "DBA":
+            clients[-1].attack_method = attack_method
+          elif attack_method == "DBA":
             clients.append(Client_DBA(model_name, optimizer_fn, loader, idnum=i, num_classes=num_classes, dataset = hp['dataset']) )
+            clients[-1].attack_method = attack_method
           else:
             import pdb; pdb.set_trace()  
 
@@ -147,11 +174,11 @@ def run_experiment(xp, xp_count, n_experiments):
     participating_clients = server.select_clients(clients, hp["participation_rate"])
     xp.log({"participating_clients" : np.array([c.id for c in participating_clients])})
     
-    if hp["attack_method"] in ["Fang", "Min-Max", "Min-Sum","KrumAtt"]:
+    if attack_method_set.intersection(["Fang", "Min-Max", "Min-Sum", "KrumAtt"]):
       mali_clients = []
       flag = False
       for client in participating_clients:
-        if client.id >= (1 - hp["attack_rate"])* len(client_loaders):
+        if getattr(client, "attack_method", "benign") in ["Fang", "Min-Max", "Min-Sum", "KrumAtt"]:
           client.synchronize_with_server(server)
           benign_stats = client.compute_weight_benign_update(hp["local_epochs"])
           mali_clients.append(client)
@@ -159,7 +186,7 @@ def run_experiment(xp, xp_count, n_experiments):
       if flag == True:
         mal_user_grad_mean2, mal_user_grad_std2, all_updates = get_benign_updates(mali_clients, server)
       for client in participating_clients:
-        if client.id >= (1 - hp["attack_rate"])* len(client_loaders):
+        if getattr(client, "attack_method", "benign") in ["Fang", "Min-Max", "Min-Sum", "KrumAtt"]:
           client.mal_user_grad_mean2 = mal_user_grad_mean2
           client.mal_user_grad_std2 = mal_user_grad_std2
           client.all_updates = all_updates
@@ -175,11 +202,13 @@ def run_experiment(xp, xp_count, n_experiments):
     elif hp["aggregation_mode"] == "median":
       server.median(participating_clients)
     elif hp["aggregation_mode"] == "NormBound":
-      server.normbound(participating_clients,  hp["attack_rate"])
+      server.normbound(participating_clients, attack_rate)
     elif hp["aggregation_mode"] == "trmean":
-      server.TrimmedMean(participating_clients, hp["attack_rate"])
+      server.TrimmedMean(participating_clients, attack_rate)
     elif hp["aggregation_mode"] == "krum":
-      server.krum(participating_clients, hp["attack_rate"])
+      server.krum(participating_clients, attack_rate)
+    elif hp["aggregation_mode"] == "flame":
+      server.flame(participating_clients)
     else:
       import pdb; pdb.set_trace()
     if xp.is_log_round(c_round):
@@ -188,11 +217,11 @@ def run_experiment(xp, xp_count, n_experiments):
       eval_result = server.evaluate_ensemble().items()
       xp.log({"server_val_{}".format(key) : value for key, value in eval_result })
       print({"server_{}_a_{}".format(key, hp["alpha"]) : value for key, value in eval_result})
-      if hp["attack_method"] in ["DBA", "Scaling", "Backdoor"]:
+      if attack_method_set.intersection(["DBA", "Scaling", "Backdoor"]):
         att_result = server.evaluate_attack().items()
         xp.log({"server_att_{}_a_{}".format(key, hp["alpha"]) : value for key, value in att_result})
         print({"server_att_{}_a_{}".format(key, hp["alpha"]) : value for key, value in att_result})
-      if hp["attack_method"] in ["targeted_label_flip"]:
+      if attack_method_set.intersection(["targeted_label_flip"]):
         att_result = server.evaluate_tr_lf_attack().items()
         xp.log({"server_att_{}_a_{}".format(key, hp["alpha"]) : value for key, value in att_result})
         print({"server_att_{}_a_{}".format(key, hp["alpha"]) : value for key, value in att_result})

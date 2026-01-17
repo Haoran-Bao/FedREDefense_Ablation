@@ -273,7 +273,9 @@ def run_experiment(xp, xp_count, n_experiments):
       print({"dacc":acc, "drecall":recall, "dfpr":fpr, "dfnr":fnr, "benign_avg_loss":benign_avg_loss, "mali_avg_loss":mali_avg_loss})
 
       filtered_clients = [item for item, label in zip(participating_clients, pred_label) if label==0]
-      if "median" in hp["aggregation_mode"]:
+      if "flame" in hp["aggregation_mode"]:
+        server.flame(filtered_clients)
+      elif "median" in hp["aggregation_mode"]:
         server.median(filtered_clients)
       elif "fedavg" in hp["aggregation_mode"]:
         server.fedavg(filtered_clients)
@@ -314,7 +316,5 @@ def run():
  
   
 if __name__ == "__main__":
-
-  
   run()
    
