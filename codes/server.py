@@ -205,6 +205,7 @@ class Server(Device):
         idx += self.parameter_dict[model_name][name].data.numel()
 
   def flame(self, clients):
+    admitted_all = []
     unique_client_model_names = np.unique([client.model_name for client in clients])
     for model_name in unique_client_model_names:
       model_clients = [client for client in clients if client.model_name == model_name]
@@ -222,12 +223,12 @@ class Server(Device):
       cosine_sim = normalized @ normalized.T
       cosine_dist = (1.0 - cosine_sim).cpu().numpy()
 
-      min_cluster_size = len(model_clients) // 3 + 1
+      min_cluster_size = len(model_clients) // 2 + 1
       clusterer = hdbscan.HDBSCAN(
           metric="precomputed",
           min_cluster_size=min_cluster_size,
-          min_samples=2,
-          allow_single_cluster=False,
+          min_samples=1,
+          allow_single_cluster=True,
       )
       labels = clusterer.fit_predict(cosine_dist)
 
@@ -239,4 +240,7 @@ class Server(Device):
         largest_label = unique_labels[np.argmax(counts)]
         admitted = [client for client, label in zip(model_clients, labels) if label == largest_label]
 
+      admitted_all.extend(admitted)
       reduce_average(target=self.parameter_dict[model_name], sources=[client.W for client in admitted])
+
+    return admitted_all

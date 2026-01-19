@@ -177,6 +177,7 @@ def run_experiment(xp, xp_count, n_experiments):
           else:
             import pdb; pdb.set_trace()  
 
+  mal_agg_counts = {c.id: 0 for c in clients if getattr(c, "attack_method", "benign") != "benign"}
   print(clients[0].model)
   # initialize data synthesizer
   synthesizer = Synthesizer(deepcopy(clients[0].model), args)
@@ -191,6 +192,7 @@ def run_experiment(xp, xp_count, n_experiments):
   maximum_acc_test, maximum_acc_val = 0, 0
   xp.log({"server_val_{}".format(key) : value for key, value in server.evaluate_ensemble().items()})
   test_accs = []
+  final_metrics = {"dacc": None, "dfpr": None, "dfnr": None, "aar": None, "tacc": None}
   start_trajectories = []
   end_trajectories = []
   syn_data = []
@@ -262,7 +264,10 @@ def run_experiment(xp, xp_count, n_experiments):
 
       avg_round_iter = round_iter/len(participating_clients)
       overall_iter += avg_round_iter
-      acc, recall, fpr, fnr, pred_label = threshold_detection(loss, labels)
+      dacc, drecall, dfpr, dfnr, pred_label = threshold_detection(loss, labels)
+      final_metrics["dacc"] = dacc
+      final_metrics["dfpr"] = dfpr
+      final_metrics["dfnr"] = dfnr
       for idx, client in enumerate(participating_clients):
           clients_flags[client.id] = (pred_label[idx] == 0)
       
@@ -270,22 +275,28 @@ def run_experiment(xp, xp_count, n_experiments):
       loss = np.array(loss).reshape(-1, 1)
       benign_avg_loss = np.mean(loss[real_label == 0])
       mali_avg_loss = np.mean(loss[real_label == 1])
-      print({"dacc":acc, "drecall":recall, "dfpr":fpr, "dfnr":fnr, "benign_avg_loss":benign_avg_loss, "mali_avg_loss":mali_avg_loss})
+      print({"dacc":dacc, "drecall":drecall, "dfpr":dfpr, "dfnr":dfnr, "benign_avg_loss":benign_avg_loss, "mali_avg_loss":mali_avg_loss})
 
       filtered_clients = [item for item, label in zip(participating_clients, pred_label) if label==0]
+      aggregated_ids = {c.id for c in filtered_clients}
+      for mid in mal_agg_counts:
+        if mid in aggregated_ids:
+          mal_agg_counts[mid] += 1
       if "median" in hp["aggregation_mode"]:
         server.median(filtered_clients)
       elif "fedavg" in hp["aggregation_mode"]:
         server.fedavg(filtered_clients)
       else:
         raise NotImplementedError
-      acc, recall, fpr, fnr, pred_label = detection_metric_per_round([1 - x for x in overall_label], [1 - x for x in clients_flags])
+      oacc, orecall, ofpr, ofnr, pred_label = detection_metric_per_round([1 - x for x in overall_label], [1 - x for x in clients_flags])
       
-      print({"overall_dacc":acc, "overall_drecall":recall, "overall_dfpr":fpr, "overall_dfnr":fnr})
+      print({"overall_dacc":oacc, "overall_drecall":orecall, "overall_dfpr":ofpr, "overall_dfnr":ofnr})
     else:
       raise NotImplementedError
     if xp.is_log_round(c_round):
       xp.log({'communication_round' : c_round, 'epochs' : c_round*hp['local_epochs']})
+      xp.log({"agg_dacc": dacc, "agg_drecall": drecall, "agg_dfpr": dfpr, "agg_dfnr": dfnr})
+      xp.log({"overall_dacc": oacc, "overall_drecall": orecall, "overall_dfpr": ofpr, "overall_dfnr": ofnr})
       xp.log({key : clients[0].optimizer.__dict__['param_groups'][0][key] for key in optimizer_hp})
       print({"server_{}_a_{}".format(key, hp["alpha"]) : value for key, value in server.evaluate_ensemble().items()})
       if attack_method_set.intersection(["DBA", "Scaling"]):
@@ -294,7 +305,19 @@ def run_experiment(xp, xp_count, n_experiments):
 
       stats = server.evaluate_ensemble()
       test_accs.append(stats['test_accuracy'])
+      final_metrics["tacc"] = stats['test_accuracy']
       xp.save_to_disc(path=args.RESULTS_PATH, name="logfiles")
+
+
+  if mal_agg_counts:
+    aar = sum(mal_agg_counts.values()) / len(mal_agg_counts)
+  else:
+    aar = 0.0
+  final_metrics["aar"] = aar
+  xp.log({"aar": aar})
+  xp.save_to_disc(path=args.RESULTS_PATH, name="logfiles")
+
+  print({"final_dacc": final_metrics["dacc"], "final_dfpr": final_metrics["dfpr"], "final_dfnr": final_metrics["dfnr"], "final_aar": final_metrics["aar"], "final_tacc": final_metrics["tacc"]})
 
   # Save model to disk
   server.save_model(path=args.CHECKPOINT_PATH, name=hp["save_model"])

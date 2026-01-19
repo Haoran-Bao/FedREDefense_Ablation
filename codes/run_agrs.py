@@ -67,6 +67,21 @@ def detection_metric_overall_flame(real_label, label_pred):
 
 
 
+def compute_detection_metrics(real_label, label_pred):
+  real_label = np.array(real_label)
+  label_pred = np.array(label_pred)
+  if label_pred.size == 0:
+    return 0.0, 0.0, 0.0, 0.0
+  nobyz = sum(real_label)
+  acc = len(label_pred[label_pred == real_label]) / label_pred.shape[0]
+  recall = np.sum(label_pred[real_label == 1] == 1) / nobyz if nobyz else 0.0
+  denom = label_pred.shape[0] - nobyz
+  fpr = np.sum(label_pred[real_label == 0] == 1) / denom if denom else 0.0
+  fnr = np.sum(label_pred[real_label == 1] == 0) / nobyz if nobyz else 0.0
+  return acc, recall, fpr, fnr
+
+
+
 
 def run_experiment(xp, xp_count, n_experiments):
   t0 = time.time()
@@ -154,6 +169,7 @@ def run_experiment(xp, xp_count, n_experiments):
           else:
             import pdb; pdb.set_trace()  
 
+  mal_agg_counts = {c.id: 0 for c in clients if getattr(c, "attack_method", "benign") != "benign"}
   print(clients[0].model)
   
   server.number_client_all = len(client_loaders)
@@ -166,6 +182,7 @@ def run_experiment(xp, xp_count, n_experiments):
   xp.log({"prep_time" : t1-t0})
   xp.log({"server_val_{}".format(key) : value for key, value in server.evaluate_ensemble().items()})
   test_accs = []
+  final_metrics = {"dacc": None, "dfpr": None, "dfnr": None, "aar": None, "tacc": None}
   
   print(f"model key {list(server.model_dict.keys())[0]}")
 
@@ -195,6 +212,7 @@ def run_experiment(xp, xp_count, n_experiments):
       client.synchronize_with_server(server)
       train_stats = client.compute_weight_update(hp["local_epochs"])
           
+    aggregated_clients = participating_clients
     if hp["aggregation_mode"] == "FedAVG":
       server.fedavg(participating_clients)
     elif hp["aggregation_mode"] == "ABAVG":
@@ -208,11 +226,23 @@ def run_experiment(xp, xp_count, n_experiments):
     elif hp["aggregation_mode"] == "krum":
       server.krum(participating_clients, attack_rate)
     elif hp["aggregation_mode"] == "flame":
-      server.flame(participating_clients)
+      aggregated_clients = server.flame(participating_clients)
     else:
       import pdb; pdb.set_trace()
+
+    aggregated_ids = {c.id for c in aggregated_clients}
+    for mid in mal_agg_counts:
+      if mid in aggregated_ids:
+        mal_agg_counts[mid] += 1
+    real_labels = [1 if getattr(c, "attack_method", "benign") != "benign" else 0 for c in participating_clients]
+    pred_labels = [0 if c.id in aggregated_ids else 1 for c in participating_clients]
+    dacc, drecall, dfpr, dfnr = compute_detection_metrics(real_labels, pred_labels)
+    final_metrics["dacc"] = dacc
+    final_metrics["dfpr"] = dfpr
+    final_metrics["dfnr"] = dfnr
     if xp.is_log_round(c_round):
       xp.log({'communication_round' : c_round, 'epochs' : c_round*hp['local_epochs']})
+      xp.log({"agg_dacc": dacc, "agg_drecall": drecall, "agg_dfpr": dfpr, "agg_dfnr": dfnr})
       xp.log({key : clients[0].optimizer.__dict__['param_groups'][0][key] for key in optimizer_hp})
       eval_result = server.evaluate_ensemble().items()
       xp.log({"server_val_{}".format(key) : value for key, value in eval_result })
@@ -229,12 +259,24 @@ def run_experiment(xp, xp_count, n_experiments):
       xp.log({"epoch_time" : (time.time()-t1)/c_round})
       stats = server.evaluate_ensemble()
       test_accs.append(stats['test_accuracy'])
+      final_metrics["tacc"] = stats['test_accuracy']
       
       # Save results to Disk
       xp.save_to_disc(path=args.RESULTS_PATH, name="logfiles")
       e = int((time.time()-t1)/c_round*(hp['communication_rounds']-c_round))
       print("Remaining Time (approx.):", '{:02d}:{:02d}:{:02d}'.format(e // 3600, (e % 3600 // 60), e % 60), 
                 "[{:.2f}%]\n".format(c_round/hp['communication_rounds']*100))
+
+
+  if mal_agg_counts:
+    aar = sum(mal_agg_counts.values()) / len(mal_agg_counts)
+  else:
+    aar = 0.0
+  final_metrics["aar"] = aar
+  xp.log({"aar": aar})
+  xp.save_to_disc(path=args.RESULTS_PATH, name="logfiles")
+
+  print({"final_dacc": final_metrics["dacc"], "final_dfpr": final_metrics["dfpr"], "final_dfnr": final_metrics["dfnr"], "final_aar": final_metrics["aar"], "final_tacc": final_metrics["tacc"]})
 
   # Save model to disk
   server.save_model(path=args.CHECKPOINT_PATH, name=hp["save_model"])
